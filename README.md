@@ -120,16 +120,22 @@ For each repo in `config.json`, every `interval_seconds` (default 90):
    - **new `<!-- claude-responder -->` comment** → fire **reviewer**
    - both deltas in one tick → reviewer wins (it reads everything anyway)
 
-State updates happen **immediately after spawn** (non-blocking). If a prior fire's worktree still exists on disk (its `EXIT` trap hasn't run yet — claude is mid-work), this tick's spawn is skipped without updating state; the next tick retries.
+State updates happen **immediately after spawn** (non-blocking). When a new fire is needed for a `(repo, role, PR)` that already has a tmux window, the watcher decides between killing the prior window (most cases) or skipping this tick (when the user has manually engaged with the prior session — see below).
 
 ## Spawn lifecycle (per fire)
 
-1. **In-flight check.** If `/tmp/<slug>-<role>-pr<N>-*` exists, skip — a prior fire is still working.
-2. **Idle-window cleanup.** If a tmux window named `<slug>-<role>-pr<N>` exists (an idle session from a prior completed fire), `tmux kill-window` it.
-3. **Worktree.** Reviewer: detached at the PR head SHA. Responder: a throwaway local branch `claude-responder/pr<N>-<ts>` starting at `origin/<head_branch>`, configured so `git push` follows upstream back to `origin/<head_branch>`.
+1. **Prior-window engagement check.** If a tmux window named `<slug>-<role>-pr<N>` exists, count "real" user messages in the prior fire's claude session jsonl (excludes tool_result echoes that the API encodes as `role:user`). If the count is `> 1` — meaning you've typed beyond the initial prompt — preserve the prior window and skip this tick; you Ctrl+C / `/exit` when ready. Otherwise: kill the prior window (its `EXIT` trap fires on SIGHUP and cleans up worktree + temp branch).
+2. **Force-clean stale worktrees.** After the kill, wait briefly for the trap to remove `/tmp/<slug>-<role>-pr<N>-*`. If anything lingers, force-remove it. Then `git worktree prune`.
+3. **Worktree creation.** Reviewer: detached at the PR head SHA. Responder: a throwaway local branch `claude-responder/pr<N>-<ts>` starting at `origin/<head_branch>`, configured so `git push` follows upstream back to `origin/<head_branch>` (your main checkout's branch pointer is never touched).
 4. **Spawn.** `tmux new-window` runs `run-fire.sh`, which pre-trusts the worktree path in `~/.claude.json` (skips Claude Code's first-run trust prompt) and launches `claude --dangerously-skip-permissions "$(cat .claude/prompts/<role>.md)"`.
 5. **Pane logging.** `tmux pipe-pane` mirrors output to `~/.local/state/claude-pr-watch/log/<slug>-<role>-pr<N>-<ts>.log`.
-6. **Cleanup.** When claude exits (or window is killed), bash's `EXIT` trap removes the worktree and deletes the throwaway `claude-responder/*` branch if one was created.
+6. **Cleanup.** When claude exits (or window is killed externally), bash's `EXIT` trap removes the worktree and deletes the throwaway `claude-responder/*` branch if one was created.
+
+### Engagement detection
+
+A "real" user message is an entry in `~/.claude/projects/<encoded-worktree-path>/<session>.jsonl` where `type == "user"` and `message.content` is either a string OR an array whose first block has `type == "text"`. Tool results (`type == "tool_result"` as the first block) are excluded.
+
+So: the initial prompt is user-message #1; any human follow-up you type in the attached tmux window is #2+. The watcher uses `count > 1` to decide "user is engaged — leave this window alone."
 
 ## Marker convention
 

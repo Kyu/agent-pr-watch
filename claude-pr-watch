@@ -98,6 +98,36 @@ ensure_session() {
 }
 slug_for() { echo "${1#*/}"; }
 
+# Count "real" user messages in the most recent claude session for a
+# given worktree (i.e., human-typed messages, not tool_result echoes
+# that the API encodes as role:user). Returns the count; 0 if no
+# session found.
+#
+# Detection: ~/.claude/projects/<encoded-path>/<session>.jsonl, where
+# <encoded-path> is the worktree's canonical absolute path with `/`
+# replaced by `-`. A "real" user message is type=="user" with
+# message.content either a string OR an array whose first block has
+# type=="text". Tool results have type=="tool_result" as first block
+# and are excluded.
+count_user_msgs() {
+  local wt="$1"
+  local canonical
+  canonical=$(cd "$wt" 2>/dev/null && pwd -P) || canonical="$wt"
+  local enc="${canonical//\//-}"
+  local proj_dir="$HOME/.claude/projects/${enc}"
+  local jsonl
+  jsonl=$(ls -t "$proj_dir"/*.jsonl 2>/dev/null | head -1)
+  [ -z "$jsonl" ] && { echo 0; return; }
+  jq -c '
+    select(.type=="user")
+    | select(
+        (.message.content | type) == "string"
+        or ((.message.content | type) == "array"
+            and ((.message.content[0].type // "") == "text"))
+      )
+  ' "$jsonl" 2>/dev/null | wc -l | tr -d ' '
+}
+
 # ---------- spawn ----------
 spawn_fire() {
   # spawn_fire <role> <repo> <repo_dir> <pr> <head_sha> [comment_id]
@@ -114,27 +144,47 @@ spawn_fire() {
     return 1
   fi
 
-  # If a prior fire's worktree still exists on disk, the EXIT trap inside
-  # that fire's bash hasn't reached worktree removal yet — claude is
-  # still mid-work. Skip this spawn; next scan retries.
-  local in_flight
-  in_flight=$(ls -d /tmp/${slug}-${role}-pr${pr}-* 2>/dev/null | head -1) || true
-  if [ -n "$in_flight" ] && [ -d "$in_flight" ]; then
-    log "$repo PR #$pr ($role): prior fire in-flight at $in_flight (skip)"
-    return 1
-  fi
-
   ensure_session
 
-  # If an idle window from a previous (completed) fire still exists,
-  # kill it. The bash inside is at "press enter to close" — its EXIT
-  # trap already ran (worktree gone, temp branch deleted), so this just
-  # frees the window slot.
+  # If a prior window exists, decide kill vs. skip based on whether
+  # the user is engaged with that session. Engagement = >1 real user
+  # message in the session jsonl (the initial prompt is #1; any
+  # additional human follow-up is #2+). When the user is engaged we
+  # keep the prior fire alive and skip this scan tick — they can
+  # Ctrl+C / close the window manually when ready.
   if tmux list-windows -t "$SESSION" -F '#{window_name}' 2>/dev/null \
        | grep -qx "$window"; then
-    log "$repo PR #$pr ($role): killing idle window $window"
+    local prior_wt
+    prior_wt=$(ls -d /tmp/${slug}-${role}-pr${pr}-* 2>/dev/null | head -1) || true
+    if [ -n "$prior_wt" ] && [ -d "$prior_wt" ]; then
+      local msg_count
+      msg_count=$(count_user_msgs "$prior_wt")
+      if [ "${msg_count:-0}" -gt 1 ]; then
+        log "$repo PR #$pr ($role): prior session has $msg_count user msgs (engaged) — skip"
+        return 1
+      fi
+    fi
+    log "$repo PR #$pr ($role): killing prior window $window"
     tmux kill-window -t "$SESSION:$window" 2>/dev/null || true
   fi
+
+  # Wait briefly for any in-progress trap cleanup to remove the worktree.
+  # If a worktree still lingers after this (trap took too long, or window
+  # was never created in a prior failed spawn attempt), force-clean it.
+  local stale_wt
+  local waited=0
+  while [ "$waited" -lt 5 ]; do
+    stale_wt=$(ls -d /tmp/${slug}-${role}-pr${pr}-* 2>/dev/null | head -1) || true
+    [ -z "$stale_wt" ] || [ ! -d "$stale_wt" ] && break
+    sleep 1
+    waited=$((waited + 1))
+  done
+  for stale_wt in /tmp/${slug}-${role}-pr${pr}-*; do
+    [ -d "$stale_wt" ] || continue
+    log "$repo PR #$pr ($role): force-cleaning stale worktree $stale_wt"
+    git -C "$repo_dir" worktree remove --force "$stale_wt" 2>/dev/null \
+      || rm -rf "$stale_wt"
+  done
 
   # Drop any stale worktree metadata pointing at gone-from-disk paths.
   git -C "$repo_dir" worktree prune >/dev/null 2>&1 || true
