@@ -1,0 +1,336 @@
+#!/usr/bin/env bash
+# claude-pr-watch — universal PR review loop watcher.
+#
+# Polls GitHub for PR events across multiple configured repos and spawns
+# Claude Code sessions (reviewer or author-responder) into a shared tmux
+# session when deltas are detected. Each fire runs in a throwaway git
+# worktree under /tmp.
+#
+# Config: $CONFIG_FILE (default: <script-dir>/config.json)
+# State:  $STATE_DIR/state.json (default: ~/.local/state/claude-pr-watch/)
+# Tmux:   session "claude-code-review" (auto-created)
+#
+# Usage:
+#   claude-pr-watch                  # run the poll loop forever
+#   claude-pr-watch --once           # one scan pass, then exit
+#   claude-pr-watch --seed-only      # record current state, fire nothing
+#   claude-pr-watch status           # print state.json
+#   claude-pr-watch --config FILE    # use a non-default config
+
+set -uo pipefail
+
+# Resolve through any symlinks so SCRIPT_DIR is the real script location
+# (e.g., ~/.local/bin/claude-pr-watch -> ~/Projects/claude-pr-watch/claude-pr-watch).
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [ -L "$SCRIPT_PATH" ]; do
+  link_dir="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+  SCRIPT_PATH="$(readlink "$SCRIPT_PATH")"
+  [[ "$SCRIPT_PATH" != /* ]] && SCRIPT_PATH="$link_dir/$SCRIPT_PATH"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+RUN_FIRE_SCRIPT="$SCRIPT_DIR/run-fire.sh"
+
+# Config search order: $CONFIG_FILE env > --config arg > XDG > script-dir.
+# (--config is handled in arg parsing below and overrides this.)
+if [ -z "${CONFIG_FILE:-}" ]; then
+  xdg_config="${XDG_CONFIG_HOME:-$HOME/.config}/claude-pr-watch/config.json"
+  if [ -f "$xdg_config" ]; then
+    CONFIG_FILE="$xdg_config"
+  else
+    CONFIG_FILE="$SCRIPT_DIR/config.json"
+  fi
+fi
+STATE_DIR="${STATE_DIR:-$HOME/.local/state/claude-pr-watch}"
+STATE_FILE="$STATE_DIR/state.json"
+LOG_DIR="$STATE_DIR/log"
+SESSION="claude-code-review"
+MARKER_REVIEWER='<!-- claude-reviewer -->'
+MARKER_RESPONDER='<!-- claude-responder -->'
+
+# ---------- arg parsing ----------
+MODE=loop
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --once)        MODE=once ;;
+    --seed-only)   MODE=seed ;;
+    status)        MODE=status ;;
+    --config)      shift; CONFIG_FILE="$1" ;;
+    --config=*)    CONFIG_FILE="${1#--config=}" ;;
+    -h|--help)     sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *)             echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+# ---------- preflight ----------
+for tool in jq gh tmux git uuidgen; do
+  command -v "$tool" >/dev/null 2>&1 || { echo "missing required tool: $tool" >&2; exit 1; }
+done
+[ -f "$CONFIG_FILE" ] || { echo "config not found: $CONFIG_FILE" >&2; exit 1; }
+[ -x "$RUN_FIRE_SCRIPT" ] || { echo "missing or non-executable: $RUN_FIRE_SCRIPT" >&2; exit 1; }
+mkdir -p "$STATE_DIR" "$LOG_DIR"
+[ -f "$STATE_FILE" ] || echo '{}' >"$STATE_FILE"
+
+log() { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
+
+# ---------- state helpers ----------
+state_get() {
+  jq -r --arg r "$1" --arg p "$2" --arg k "$3" '.[$r][$p][$k] // empty' "$STATE_FILE"
+}
+state_apply() {
+  # state_apply <jq-expression> [extra --arg ...]
+  local expr="$1"; shift
+  jq "$@" "$expr" "$STATE_FILE" >"$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+}
+
+# ---------- config readers ----------
+cfg() { jq -r "$@" "$CONFIG_FILE"; }
+DEFAULT_INTERVAL=$(cfg '.defaults.interval_seconds // 90')
+DEFAULT_DRAFTS=$(cfg '.defaults.include_drafts // false')
+DEFAULT_AUTHOR=$(cfg '.defaults.author_filter // "@me"')
+NUM_REPOS=$(cfg '.repos | length')
+
+[ "$NUM_REPOS" -gt 0 ] || { echo "no repos configured in $CONFIG_FILE" >&2; exit 1; }
+
+# ---------- tmux helpers ----------
+ensure_session() {
+  tmux has-session -t "$SESSION" 2>/dev/null || tmux new-session -d -s "$SESSION"
+}
+slug_for() { echo "${1#*/}"; }
+
+# ---------- spawn ----------
+spawn_fire() {
+  # spawn_fire <role> <repo> <repo_dir> <pr> <head_sha> [comment_id]
+  local role="$1" repo="$2" repo_dir="$3" pr="$4" head_sha="$5" comment_id="${6:-}"
+  local slug; slug=$(slug_for "$repo")
+  # One window per (repo, role, PR) — no timestamp suffix. Auto-kill
+  # below replaces accumulation with reuse.
+  local window="${slug}-${role}-pr${pr}"
+  local wt="/tmp/${slug}-${role}-pr${pr}-$(uuidgen | head -c 8 | tr 'A-Z' 'a-z')"
+  local logfile="$LOG_DIR/${slug}-${role}-pr${pr}-$(date +%s).log"
+
+  if [ ! -f "$repo_dir/.claude/prompts/${role}.md" ]; then
+    log "$repo PR #$pr ($role): missing $repo_dir/.claude/prompts/${role}.md (skip)"
+    return 1
+  fi
+
+  # If a prior fire's worktree still exists on disk, the EXIT trap inside
+  # that fire's bash hasn't reached worktree removal yet — claude is
+  # still mid-work. Skip this spawn; next scan retries.
+  local in_flight
+  in_flight=$(ls -d /tmp/${slug}-${role}-pr${pr}-* 2>/dev/null | head -1) || true
+  if [ -n "$in_flight" ] && [ -d "$in_flight" ]; then
+    log "$repo PR #$pr ($role): prior fire in-flight at $in_flight (skip)"
+    return 1
+  fi
+
+  ensure_session
+
+  # If an idle window from a previous (completed) fire still exists,
+  # kill it. The bash inside is at "press enter to close" — its EXIT
+  # trap already ran (worktree gone, temp branch deleted), so this just
+  # frees the window slot.
+  if tmux list-windows -t "$SESSION" -F '#{window_name}' 2>/dev/null \
+       | grep -qx "$window"; then
+    log "$repo PR #$pr ($role): killing idle window $window"
+    tmux kill-window -t "$SESSION:$window" 2>/dev/null || true
+  fi
+
+  # Drop any stale worktree metadata pointing at gone-from-disk paths.
+  git -C "$repo_dir" worktree prune >/dev/null 2>&1 || true
+
+  local wt_err
+  if [ "$role" = "reviewer" ]; then
+    git -C "$repo_dir" fetch origin "pull/$pr/head:refs/remotes/pr/$pr" >/dev/null 2>&1 || true
+    if ! wt_err=$(git -C "$repo_dir" worktree add --detach "$wt" "$head_sha" 2>&1); then
+      log "$repo PR #$pr ($role): worktree add failed at $head_sha: $wt_err"
+      return 1
+    fi
+  else
+    local head_branch
+    head_branch=$(gh pr view "$pr" --repo "$repo" --json headRefName -q .headRefName 2>/dev/null) \
+      || { log "$repo PR #$pr ($role): could not resolve head branch"; return 1; }
+    git -C "$repo_dir" fetch origin "$head_branch" >/dev/null 2>&1 || true
+    # Use a throwaway local branch that starts at origin/<head_branch>.
+    # The responder commits on this temp branch; `git push` (configured
+    # below via upstream + push.default) pushes back to
+    # origin/<head_branch>. Your main checkout's local <head_branch> is
+    # never touched by this — you fetch/pull afterward to pick up the
+    # commits, same as if a teammate had pushed.
+    local temp_branch="claude-responder/pr${pr}-$(date +%s)"
+    if ! wt_err=$(git -C "$repo_dir" worktree add -b "$temp_branch" "$wt" "origin/$head_branch" 2>&1); then
+      log "$repo PR #$pr ($role): worktree add failed for temp branch $temp_branch: $wt_err"
+      return 1
+    fi
+    git -C "$wt" branch --set-upstream-to="origin/$head_branch" "$temp_branch" >/dev/null 2>&1
+    git -C "$wt" config push.default upstream
+    git -C "$wt" config user.name 'claude-responder[bot]'
+    git -C "$wt" config user.email 'claude-responder@users.noreply.github.com'
+  fi
+
+  tmux new-window -t "$SESSION" -n "$window" -c "$wt" \
+    -e "ROLE=$role" \
+    -e "PR=$pr" \
+    -e "HEAD_SHA=$head_sha" \
+    -e "REPO=$repo" \
+    -e "REPO_DIR=$repo_dir" \
+    -e "WT=$wt" \
+    -e "LOGFILE=$logfile" \
+    -e "COMMENT_ID=$comment_id" \
+    "$RUN_FIRE_SCRIPT"
+
+  # Mirror the pane output to a log file so we have durable history.
+  tmux pipe-pane -t "$SESSION:$window" "cat >> '$logfile'" 2>/dev/null || true
+
+  log "spawned $window (worktree: $wt, log: $logfile)"
+  return 0
+}
+
+# ---------- per-repo scan ----------
+scan_repo() {
+  local i="$1"
+  local repo repo_dir author_filter label_filter include_drafts
+  repo=$(cfg ".repos[$i].name")
+  repo_dir=$(cfg ".repos[$i].dir" | sed "s|^~|$HOME|")
+  author_filter=$(cfg ".repos[$i].author_filter // \"$DEFAULT_AUTHOR\"")
+  label_filter=$(cfg ".repos[$i].label_filter // \"\"")
+  include_drafts=$(cfg ".repos[$i].include_drafts // $DEFAULT_DRAFTS")
+  local slug; slug=$(slug_for "$repo")
+
+  if [ ! -d "$repo_dir/.git" ]; then
+    log "$repo: $repo_dir is not a git repo (skip)"
+    return
+  fi
+
+  local pr_args=(--repo "$repo" --state open --json number,headRefOid,labels,isDraft)
+  [ -n "$author_filter" ] && pr_args+=(--author "$author_filter")
+
+  local prs_json
+  if ! prs_json=$(gh pr list "${pr_args[@]}" 2>/dev/null); then
+    log "$repo: gh pr list failed (skip this tick)"
+    return
+  fi
+
+  local prs_filtered
+  prs_filtered=$(echo "$prs_json" | jq \
+    --argjson drafts "$include_drafts" \
+    --arg label "$label_filter" '
+      [.[] | select(
+        ($drafts or (.isDraft == false)) and
+        ($label == "" or ((.labels // []) | map(.name) | index($label))) and
+        (((.labels // []) | map(.name) | index("needs-human")) | not)
+      )]')
+
+  # Cleanup: drop closed PRs from state
+  local open_numbers
+  open_numbers=$(echo "$prs_filtered" | jq -r '[.[].number | tostring]')
+  local known
+  known=$(jq -r --arg r "$repo" '(.[$r] // {}) | keys[]' "$STATE_FILE")
+  if [ -n "$known" ]; then
+    while IFS= read -r kp; do
+      [ -z "$kp" ] && continue
+      if ! echo "$open_numbers" | jq -e --arg kp "$kp" 'index($kp)' >/dev/null; then
+        log "$repo: dropping closed PR #$kp from state"
+        state_apply 'del(.[$r][$p])' --arg r "$repo" --arg p "$kp"
+      fi
+    done <<<"$known"
+  fi
+
+  # Iterate currently-open PRs
+  local pr_count
+  pr_count=$(echo "$prs_filtered" | jq 'length')
+  local j=0
+  while [ "$j" -lt "$pr_count" ]; do
+    local pr_num pr_head
+    pr_num=$(echo "$prs_filtered" | jq -r ".[$j].number")
+    pr_head=$(echo "$prs_filtered" | jq -r ".[$j].headRefOid")
+    j=$((j + 1))
+
+    local last_head last_cid
+    last_head=$(state_get "$repo" "$pr_num" "head_sha")
+    last_cid=$(state_get "$repo" "$pr_num" "last_comment_id")
+    last_cid="${last_cid:-0}"
+
+    local comments
+    comments=$(gh api "repos/$repo/pulls/$pr_num/comments" --paginate 2>/dev/null) || comments='[]'
+
+    local new_reviewer new_responder max_cid
+    new_reviewer=$(echo "$comments" | jq --argjson lc "$last_cid" --arg m "$MARKER_REVIEWER" \
+      '[.[] | select(.id > $lc) | select((.body // "") | contains($m))] | length')
+    new_responder=$(echo "$comments" | jq --argjson lc "$last_cid" --arg m "$MARKER_RESPONDER" \
+      '[.[] | select(.id > $lc) | select((.body // "") | contains($m))] | length')
+    max_cid=$(echo "$comments" | jq --argjson lc "$last_cid" '([.[].id, $lc] | max)')
+
+    local reviewer_fire=0 responder_fire=0
+    [ "$pr_head" != "$last_head" ] && reviewer_fire=1
+    [ "$new_responder" -gt 0 ] && reviewer_fire=1
+    [ "$new_reviewer" -gt 0 ] && responder_fire=1
+    [ "$reviewer_fire" = 1 ] && responder_fire=0
+
+    # spawn_fire returns 1 if a prior fire is still in-flight (worktree on
+    # disk), in which case state stays unchanged and we retry next scan.
+    if [ "$reviewer_fire" = 1 ]; then
+      if spawn_fire reviewer "$repo" "$repo_dir" "$pr_num" "$pr_head"; then
+        state_apply '.[$r][$p] = {head_sha: $sha, last_comment_id: ($cid|tonumber), last_seen: $ts}' \
+          --arg r "$repo" --arg p "$pr_num" --arg sha "$pr_head" \
+          --arg cid "$max_cid" --arg ts "$(date -u +%FT%TZ)"
+      fi
+    elif [ "$responder_fire" = 1 ]; then
+      if spawn_fire responder "$repo" "$repo_dir" "$pr_num" "$pr_head"; then
+        state_apply '.[$r][$p].last_comment_id = ($cid|tonumber) | .[$r][$p].head_sha = $sha | .[$r][$p].last_seen = $ts' \
+          --arg r "$repo" --arg p "$pr_num" --arg sha "$pr_head" \
+          --arg cid "$max_cid" --arg ts "$(date -u +%FT%TZ)"
+      fi
+    fi
+  done
+}
+
+# ---------- mode runners ----------
+do_seed() {
+  local i=0
+  while [ "$i" -lt "$NUM_REPOS" ]; do
+    local repo prs
+    repo=$(cfg ".repos[$i].name")
+    prs=$(gh pr list --repo "$repo" --state open --json number,headRefOid \
+            --jq '.[] | "\(.number) \(.headRefOid)"' 2>/dev/null) || prs=""
+    while IFS=' ' read -r pr head; do
+      [ -z "$pr" ] && continue
+      local max_cid
+      max_cid=$(gh api "repos/$repo/pulls/$pr/comments" --paginate \
+                  --jq '([.[].id, 0] | max)' 2>/dev/null) || max_cid=0
+      state_apply '.[$r][$p] = {head_sha: $sha, last_comment_id: ($cid|tonumber), last_seen: $ts}' \
+        --arg r "$repo" --arg p "$pr" --arg sha "$head" \
+        --arg cid "$max_cid" --arg ts "$(date -u +%FT%TZ)"
+      log "seeded $repo PR #$pr (head=${head:0:7}, last_cid=$max_cid)"
+    done <<<"$prs"
+    i=$((i + 1))
+  done
+}
+
+do_status() { jq '.' "$STATE_FILE"; }
+
+do_scan_once() {
+  local i=0
+  while [ "$i" -lt "$NUM_REPOS" ]; do
+    scan_repo "$i" || true
+    i=$((i + 1))
+  done
+}
+
+do_loop() {
+  log "watching $NUM_REPOS repo(s) every ${DEFAULT_INTERVAL}s"
+  log "state: $STATE_FILE"
+  log "logs:  $LOG_DIR"
+  log "tmux:  tmux attach -t $SESSION"
+  while true; do
+    do_scan_once
+    sleep "$DEFAULT_INTERVAL"
+  done
+}
+
+case "$MODE" in
+  loop)   do_loop ;;
+  once)   do_scan_once ;;
+  seed)   do_seed ;;
+  status) do_status ;;
+esac

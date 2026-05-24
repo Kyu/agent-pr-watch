@@ -1,0 +1,5 @@
+# Live config — per-machine, never committed (may name private repos).
+/config.json
+
+# macOS noise
+.DS_Store

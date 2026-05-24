@@ -1,0 +1,22 @@
+{
+  "defaults": {
+    "interval_seconds": 90,
+    "include_drafts": false,
+    "author_filter": "@me",
+    "escalation_turns": 3
+  },
+  "repos": [
+    {
+      "name": "owner/repo-a",
+      "dir": "~/Projects/repo-a"
+    },
+    {
+      "name": "owner/repo-b",
+      "dir": "~/Projects/repo-b",
+      "author_filter": "",
+      "label_filter": "claude-review",
+      "escalation_turns": 4,
+      "include_drafts": false
+    }
+  ]
+}
