@@ -1,0 +1,24 @@
+{
+  "name": "agent-pr-watch",
+  "version": "0.1.0",
+  "description": "Wait for GitHub pull request changes from the current coding or review session.",
+  "author": {
+    "name": "Kyu",
+    "url": "https://github.com/Kyu"
+  },
+  "homepage": "https://github.com/Kyu/agent-pr-watch",
+  "repository": "https://github.com/Kyu/agent-pr-watch",
+  "keywords": ["github", "pull-request", "watch", "code-review"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Agent PR Watch",
+    "shortDescription": "Wait for PR changes in the current agent session.",
+    "longDescription": "Watch a GitHub pull request from the active coding or review session, then resume in the same local checkout.",
+    "developerName": "Kyu",
+    "category": "Productivity",
+    "capabilities": ["Read"],
+    "defaultPrompt": [
+      "Watch the current pull request and resume this task when it changes."
+    ]
+  }
+}

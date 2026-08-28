@@ -1,0 +1,11 @@
+{
+  "name": "agent-pr-watch",
+  "version": "0.1.0",
+  "description": "Wait for GitHub pull request changes from the current Claude Code or Codex session.",
+  "author": {
+    "name": "Kyu",
+    "url": "https://github.com/Kyu"
+  },
+  "homepage": "https://github.com/Kyu/agent-pr-watch",
+  "repository": "https://github.com/Kyu/agent-pr-watch"
+}

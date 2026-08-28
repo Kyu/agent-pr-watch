@@ -1,0 +1,14 @@
+{
+  "name": "agent-pr-watch",
+  "owner": {
+    "name": "Kyu"
+  },
+  "description": "Local, session-owned pull request watching for Claude Code and Codex.",
+  "plugins": [
+    {
+      "name": "agent-pr-watch",
+      "source": "./",
+      "description": "Wait for pull request activity, then resume the current Claude Code or Codex task in the same local checkout"
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "name": "agent-pr-watch",
+  "interface": {
+    "displayName": "Agent PR Watch"
+  },
+  "plugins": [
+    {
+      "name": "agent-pr-watch",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
