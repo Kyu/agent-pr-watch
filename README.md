@@ -10,8 +10,8 @@ spawned review agent, throwaway worktree, or background configuration file.
 
 - Bash
 - An authenticated [GitHub CLI](https://cli.github.com/) (`gh`)
-- A local checkout whose current branch has a pull request, unless `--repo` and
-  `--pr` are supplied explicitly
+- A local checkout. The watcher can start before the current branch has a pull
+  request and attach when one appears.
 
 ## Install
 
@@ -61,12 +61,17 @@ After installing the plugin, start the agent in the local checkout that should
 remain authoritative:
 
 - Claude Code: `/agent-pr-watch:watch-pr Watch PR 42 and then continue the review.`
-- Codex: `$watch-pr Watch PR 42 and then continue the review.`
+- Codex: `$agent-pr-watch:watch-pr Watch PR 42 and then continue the review.`
 - Natural language: `Watch the current PR and resume this task when it changes.`
+- Before a current-branch PR exists: `Watch this branch; review its PR as soon as it is opened.`
+- Any branch: `Watch the next PR created anywhere in this repository, then review it.`
 
-The skill runs the watcher in the foreground. When a change is first noticed,
-it waits 30 seconds, checks GitHub one more time, and returns `change detected`
-with a short metadata-only summary of where activity occurred:
+The skill launches one watcher process. Claude Code uses a background-task
+completion notification; Codex keeps the wait in the host/tool layer instead of
+running a model-driven foreground polling loop. It never detaches a process
+unless the host can wake the agent when that process finishes. When a change is
+first noticed, it waits 30 seconds, checks GitHub one more time, and returns
+`change detected` with a short metadata-only summary of where activity occurred:
 
 - conversation comments
 - submitted code reviews and requested-changes status
@@ -81,6 +86,12 @@ The watcher does not switch, pull, reset, or create a worktree. After it wakes,
 the skill compares the checked-out `HEAD` with the PR head and reports any
 mismatch rather than silently changing the checkout.
 
+When the current branch has no PR yet, the watcher waits for an open PR whose
+head matches that branch and the current local `HEAD`. PR creation wakes the
+agent for the initial task. `--next-pr-any-branch` instead selects the first PR
+created anywhere in the repository after watching starts; it never switches the
+local checkout, so the same local-head safety check still applies.
+
 ## Run the script directly
 
 ```bash
@@ -91,7 +102,8 @@ Options:
 
 ```text
 --repo OWNER/REPO    GitHub repository; defaults to the current repository
---pr NUMBER          Pull request; defaults to the PR for the current branch
+--pr NUMBER          Pull request; defaults to an open PR for the current branch
+--next-pr-any-branch Wait for the next PR created anywhere in the repository
 --interval SECONDS   Poll interval; defaults to 15
 --settle SECONDS     Final-check delay; defaults to 30
 ```
