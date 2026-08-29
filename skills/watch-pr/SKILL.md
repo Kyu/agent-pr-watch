@@ -29,18 +29,19 @@ keep idle waiting below the model layer:
 
 - In Claude Code, prefer a background shell task that sends a completion
   notification. Start it once and do not poll its output while it is running.
-- In Codex, prefer a host execution primitive that owns the long-running
-  command and wakes the agent only when it exits. If it yields a process handle,
-  reuse that handle with the host's blocking wait or longest supported wait.
-  When the tool layer can wait repeatedly inside one tool invocation, keep the
-  handle waits there so intermediate timeouts never return to the model.
+- In Codex, run the watcher once as a foreground shell command with a 24-hour
+  timeout (86,400 seconds), or the longest timeout the execution host supports.
+  This long foreground call is intentional: the tool layer sleeps while the
+  script polls, then the watcher exit completes the tool call and wakes Codex.
+  Do not request a short yield timeout.
+- If the Codex host imposes a shorter hard limit and yields a process handle,
+  reuse that same handle with its longest blocking wait. Never start a second
+  watcher.
 - Never build a model-driven loop around `ps`, `jobs`, `kill -0`, output-file
   checks, fresh shell calls, or short process-handle polls. Do not narrate an
   unchanged status or reason about it between waits.
-- Do not blindly detach with `&` or `nohup`: without a host completion event,
-  the agent cannot resume automatically. If the host offers neither completion
-  notification nor a blocking process wait, report that limitation instead of
-  spending model turns simulating a watcher.
+- Do not detach the Codex watcher with `&` or `nohup`; the live foreground tool
+  call is what wakes the agent when a change is detected.
 
 An unchanged PR is expected and is not a blocker. Waiting itself requires no
 reasoning; resume work only when the process produces output or exits.

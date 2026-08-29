@@ -67,11 +67,12 @@ remain authoritative:
 - Any branch: `Watch the next PR created anywhere in this repository, then review it.`
 
 The skill launches one watcher process. Claude Code uses a background-task
-completion notification; Codex keeps the wait in the host/tool layer instead of
-running a model-driven foreground polling loop. It never detaches a process
-unless the host can wake the agent when that process finishes. When a change is
-first noticed, it waits 30 seconds, checks GitHub one more time, and returns
-`change detected` with a short metadata-only summary of where activity occurred:
+completion notification. Codex runs one foreground shell call with a 24-hour
+timeout, or the longest timeout its host supports, and does not poll it from the
+model. The live call completes and wakes Codex when the watcher exits. When a
+change is first noticed, the watcher waits 30 seconds, checks GitHub one more
+time, and returns `change detected` with a short metadata-only summary of where
+activity occurred:
 
 - conversation comments
 - submitted code reviews and requested-changes status
